@@ -9,13 +9,9 @@ using System.Collections.Generic;
 using System.Text;
 using System.Linq;
 using System.Reflection;
-using Unity.Netcode;
-using CustomSoundsComponents;
-using Object = UnityEngine.Object;
-using HarmonyLib.Tools;
-using TerminalApi;
-using static UnityEngine.Rendering.ReloadAttribute;
+using CustomSounds.Networking;
 using BepInEx.Configuration;
+using CustomSounds.Patches;
 
 namespace CustomSounds
 {
@@ -24,7 +20,7 @@ namespace CustomSounds
     {
         private const string PLUGIN_GUID = "CustomSounds";
         private const string PLUGIN_NAME = "Custom Sounds";
-        private const string PLUGIN_VERSION = "1.3.0";
+        private const string PLUGIN_VERSION = "2.2.0";
 
         public static Plugin Instance;
         internal ManualLogSource logger;
@@ -35,9 +31,12 @@ namespace CustomSounds
         public HashSet<string> modifiedSounds = new HashSet<string>();
         public Dictionary<string, string> soundHashes = new Dictionary<string, string>();
         public Dictionary<string, string> soundPacks = new Dictionary<string, string>();
+
         public static bool Initialized { get; private set; }
 
         public static ConfigEntry<KeyboardShortcut> AcceptSyncKey;
+
+        public ConfigEntry<bool> configUseNetworking;
 
         private void Awake()
         {
@@ -45,12 +44,17 @@ namespace CustomSounds
             {
                 Instance = this;
                 logger = BepInEx.Logging.Logger.CreateLogSource(PLUGIN_GUID);
-                logger.LogInfo($"Plugin {PLUGIN_GUID} is loaded!");
+
+                configUseNetworking = Config.Bind("Experimental", "EnableNetworking", true, "Whether or not to use the networking built into this plugin. If set to true everyone in the lobby needs CustomSounds to join and also \"EnableNetworking\" set to true.");
+                AcceptSyncKey = Config.Bind("Experimental", "AcceptSyncKey", new KeyboardShortcut(KeyCode.F8), "Key to accept audio sync.");
 
                 harmony = new Harmony(PLUGIN_GUID);
-                harmony.PatchAll();
-
-                AcceptSyncKey = Config.Bind("General", "AcceptSyncKey", new KeyboardShortcut(KeyCode.F8), "Key to accept audio sync.");
+                harmony.PatchAll(typeof(TerminalParsePlayerSentencePatch));
+                harmony.PatchAll(typeof(RemapKeyPatch));
+                if (configUseNetworking.Value)
+                {
+                    harmony.PatchAll(typeof(NetworkObjectManager));
+                }
 
                 modifiedSounds = new HashSet<string>();
 
@@ -94,9 +98,10 @@ namespace CustomSounds
                         }
                     }
                 }
+
+                logger.LogInfo($"Plugin {PLUGIN_GUID} is loaded!");
             }
         }
-
 
         internal void Start() => this.Initialize();
 
@@ -116,6 +121,34 @@ namespace CustomSounds
         private void OnApplicationQuit()
         {
             DeleteTempFolder();
+        }
+
+        public GameObject LoadNetworkPrefabFromEmbeddedResource()
+        {
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            string resourceName = "CustomSounds.Bundle.audionetworkhandler";
+
+            using (Stream stream = assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream == null)
+                {
+                    Debug.LogError("Asset bundle not found in embedded resources.");
+                    return null;
+                }
+
+                byte[] buffer = new byte[stream.Length];
+                stream.Read(buffer, 0, buffer.Length);
+
+                AssetBundle bundle = AssetBundle.LoadFromMemory(buffer);
+                if (bundle == null)
+                {
+                    Debug.LogError("Failed to load AssetBundle from memory.");
+                    return null;
+                }
+
+                GameObject prefab = bundle.LoadAsset<GameObject>("audionetworkhandler");
+                return prefab;
+            }
         }
 
         public void DeleteTempFolder()
@@ -142,7 +175,7 @@ namespace CustomSounds
 
         public string GetCustomSoundsTempFolderPath()
         {
-            return Path.Combine(GetCustomSoundsFolderPath(), "Temp");
+            return Path.Combine(GetCustomSoundsFolderPath(), "Temporary-Sync");
         }
 
         public static byte[] SerializeWavToBytes(string filePath)
@@ -177,15 +210,13 @@ namespace CustomSounds
         {
             try
             {
-                string customSoundsPath = Plugin.Instance.GetCustomSoundsTempFolderPath();
-                string tempSyncPath = Path.Combine(customSoundsPath, "CustomSounds");
-                string tempSyncPath2 = Path.Combine(tempSyncPath, "Temporary-Sync");
-                if (!Directory.Exists(tempSyncPath2))
+                string customTempSoundsPath = Plugin.Instance.GetCustomSoundsTempFolderPath();
+                if (!Directory.Exists(customTempSoundsPath))
                 {
                     Plugin.Instance.logger.LogInfo("\"Temporary-Sync\" folder not found. Creating it now.");
-                    Directory.CreateDirectory(tempSyncPath2);
+                    Directory.CreateDirectory(customTempSoundsPath);
                 }
-                File.WriteAllBytes(Path.Combine(tempSyncPath2, audioFileName), byteArray);
+                File.WriteAllBytes(Path.Combine(customTempSoundsPath, audioFileName), byteArray);
 
                 Console.WriteLine($"WAV file \"{audioFileName}\" created!");
             }
@@ -231,14 +262,25 @@ namespace CustomSounds
 
         public void RevertSounds()
         {
+            HashSet<string> restoredSounds = new HashSet<string>();
+
             foreach (string soundName in currentSounds)
             {
-                logger.LogInfo($"{soundName} restored.");
-                SoundTool.RestoreAudioClip(soundName);
+                string correctSoundName = soundName;
+                if (soundName.Contains("-"))
+                    correctSoundName = soundName.Substring(0, soundName.IndexOf("-"));
+
+                if (!restoredSounds.Contains(correctSoundName))
+                {
+                    logger.LogInfo($"{correctSoundName} restored.");
+                    SoundTool.RestoreAudioClip(correctSoundName);
+                    restoredSounds.Add(correctSoundName);
+                }
             }
 
             logger.LogInfo("Original game sounds restored.");
         }
+
         public static string CalculateMD5(string filename)
         {
             using (var md5 = System.Security.Cryptography.MD5.Create())
@@ -251,26 +293,27 @@ namespace CustomSounds
             }
         }
 
+        private Dictionary<string, string> customSoundNames = new Dictionary<string, string>();
+
         public void ReloadSounds(bool serverSync, bool isTemporarySync)
         {
-            foreach (string soundName in currentSounds)
-            {
-                SoundTool.RestoreAudioClip(soundName);
-            }
-
             oldSounds = new HashSet<string>(currentSounds);
             modifiedSounds.Clear();
 
             string pluginPath = Path.GetDirectoryName(Paths.PluginPath);
             currentSounds.Clear();
 
+            customSoundNames.Clear();
 
             string customSoundsPath = GetCustomSoundsTempFolderPath();
 
-            logger.LogInfo($"Temporary folder: {customSoundsPath}");
-            if (Directory.Exists(customSoundsPath) && isTemporarySync)
+            if (isTemporarySync)
             {
-                ProcessDirectory(customSoundsPath, serverSync, true);
+                logger.LogInfo($"Temporary folder: {customSoundsPath}");
+                if (Directory.Exists(customSoundsPath))
+                {
+                    ProcessDirectory(customSoundsPath, serverSync, true);
+                }
             }
 
             ProcessDirectory(pluginPath, serverSync, false);
@@ -291,64 +334,113 @@ namespace CustomSounds
             }
         }
 
+        private (string soundName, int? percentage, string customName) ParseSoundFileName(string fullSoundName)
+        {
+            string[] splitName = fullSoundName.Split('-');
+            string lastElement = splitName[splitName.Length - 1].Replace(".wav", "");
+
+            if (int.TryParse(lastElement, out int percentage))
+            {
+                string soundName = splitName[0];
+                string customName = string.Join(" ", splitName.Skip(1).Take(splitName.Length - 2));
+                return (soundName, percentage, customName);
+            }
+            else
+            {
+                return (splitName[0], null, string.Join(" ", splitName.Skip(1)).Replace(".wav", ""));
+            }
+        }
+
         private void ProcessSoundFiles(string directoryPath, string packName, bool serverSync, bool isTemporarySync)
         {
             foreach (string file in Directory.GetFiles(directoryPath, "*.wav"))
             {
-                string soundName = Path.GetFileNameWithoutExtension(file);
+                string fullSoundName = Path.GetFileNameWithoutExtension(file);
+                var (soundName, percentage, customName) = ParseSoundFileName(fullSoundName);
+
+                string soundKey = percentage.HasValue
+                    ? $"{soundName}-{customName}-{percentage.Value}"
+                    : $"{soundName}-{customName}";
+
                 string newHash = CalculateMD5(file);
 
-                if (!isTemporarySync && modifiedSounds.Contains(soundName)) return;
+                if (!isTemporarySync && currentSounds.Contains(soundKey)) continue;
 
-                if (soundHashes.TryGetValue(soundName, out var oldHash) && oldHash != newHash)
+                if (soundHashes.TryGetValue(soundKey, out var oldHash) && oldHash != newHash)
                 {
-                    modifiedSounds.Add(soundName);
+                    modifiedSounds.Add(soundKey);
                 }
 
                 AudioClip customSound = SoundTool.GetAudioClip(directoryPath, "", file);
                 SoundTool.ReplaceAudioClip(soundName, customSound);
 
-                soundHashes[soundName] = newHash;
-                currentSounds.Add(soundName);
+                soundHashes[soundKey] = newHash;
+                currentSounds.Add(soundKey);
                 soundPacks[soundName] = packName;
-                logger.LogInfo($"[{packName}] {soundName} sound replaced!");
+
+                string logInfo = $"[{packName}] {soundName} sound replaced!";
+                if (percentage > 0)
+                    logInfo += $" (Random chance: {percentage}%)";
+
+                logger.LogInfo(logInfo);
+
+                string customNameKey = soundName + (percentage.HasValue ? $"-{percentage.Value}-{customName}" : $"-{customName}");
+                if (!string.IsNullOrEmpty(customName))
+                {
+                    customSoundNames[customNameKey] = customName;
+                }
+
 
                 if (serverSync)
                 {
-                    logger.LogInfo($"[{Path.Combine(directoryPath, soundName + ".wav")}] {soundName + ".wav"}!");
-                    AudioNetworkHandler.Instance.QueueAudioData(Plugin.SerializeWavToBytes(Path.Combine(directoryPath, soundName + ".wav")), soundName + ".wav");
+                    string filePath = Path.Combine(directoryPath, fullSoundName + ".wav");
+                    logger.LogInfo($"[{filePath}] {fullSoundName + ".wav"}!");
+                    AudioNetworkHandler.Instance.QueueAudioData(Plugin.SerializeWavToBytes(filePath), fullSoundName + ".wav");
                 }
             }
         }
 
-        public string GetSoundChanges()
+        public string ListAllSounds(bool isListing)
         {
-            StringBuilder sb = new StringBuilder("Customsounds reloaded.\n\n");
-
-            var newSoundsSet = new HashSet<string>(currentSounds.Except(oldSounds));
-            var deletedSoundsSet = new HashSet<string>(oldSounds.Except(currentSounds));
-            var existingSoundsSet = new HashSet<string>(oldSounds.Intersect(currentSounds).Except(modifiedSounds));
-            var modifiedSoundsSet = new HashSet<string>(modifiedSounds);
+            StringBuilder sb = new StringBuilder(isListing ? "Listing all currently loaded custom sounds:\n\n" : "Customsounds reloaded.\n\n");
 
             var soundsByPack = new Dictionary<string, List<string>>();
 
             Action<HashSet<string>, string> addSoundsToPack = (soundsSet, status) =>
             {
-                foreach (var sound in soundsSet)
+                foreach (var fullSoundName in soundsSet)
                 {
-                    string packName = soundPacks[sound];
+                    var (baseSoundName, pct, customNamePart) = ParseSoundFileName(fullSoundName);
+                    string percentageText = pct.HasValue ? $" (Random: {pct.Value}%)" : "";
+                    string customNameText = "";
+
+                    string keyForCustomName = baseSoundName + (pct.HasValue ? $"-{pct.Value}-{customNamePart}" : $"-{customNamePart}");
+                    if (customSoundNames.TryGetValue(keyForCustomName, out string name))
+                    {
+                        customNameText = $" [{name}]";
+                    }
+
+                    string packName = soundPacks.ContainsKey(baseSoundName) ? soundPacks[baseSoundName] : "Unknown";
+
                     if (!soundsByPack.ContainsKey(packName))
                     {
                         soundsByPack[packName] = new List<string>();
                     }
-                    soundsByPack[packName].Add($"{sound} ({status})");
+
+                    string soundInfo = isListing ? $"{baseSoundName}{percentageText}{customNameText}" : $"{baseSoundName} ({status}){percentageText}{customNameText}";
+                    soundsByPack[packName].Add(soundInfo);
                 }
             };
 
-            addSoundsToPack(newSoundsSet, "New");
-            addSoundsToPack(deletedSoundsSet, "Deleted");
-            addSoundsToPack(modifiedSoundsSet, "Modified");
-            addSoundsToPack(existingSoundsSet, "Already Existed");
+            if (!isListing)
+            {
+                addSoundsToPack(new HashSet<string>(currentSounds.Except(oldSounds)), "N¹");
+                addSoundsToPack(new HashSet<string>(oldSounds.Except(currentSounds)), "D²");
+                addSoundsToPack(new HashSet<string>(oldSounds.Intersect(currentSounds).Except(modifiedSounds)), "A.E³");
+                addSoundsToPack(new HashSet<string>(modifiedSounds), "M⁴");
+            }
+            else
+                addSoundsToPack(new HashSet<string>(currentSounds), "N¹");
 
             foreach (var pack in soundsByPack.Keys)
             {
@@ -360,223 +452,18 @@ namespace CustomSounds
                 sb.AppendLine();
             }
 
-            return sb.ToString();
-        }
 
-        public string ListAllSounds()
-        {
-            StringBuilder sb = new StringBuilder("Listing all currently loaded custom sounds:\n\n");
-
-            var soundsByPack = new Dictionary<string, List<string>>();
-
-            foreach (var sound in currentSounds)
+            if (!isListing)
             {
-                string packName = soundPacks[sound];
-                if (!soundsByPack.ContainsKey(packName))
-                {
-                    soundsByPack[packName] = new List<string>();
-                }
-                soundsByPack[packName].Add(sound);
-            }
-
-            foreach (var pack in soundsByPack.Keys)
-            {
-                sb.AppendLine($"{pack} :");
-                foreach (var sound in soundsByPack[pack])
-                {
-                    sb.AppendLine($"- {sound}");
-                }
+                sb.AppendLine("Footnotes:");
+                sb.AppendLine("¹ N = New");
+                sb.AppendLine("² D = Deleted");
+                sb.AppendLine("³ A.E = Already Existed");
+                sb.AppendLine("⁴ M = Modified");
                 sb.AppendLine();
             }
 
             return sb.ToString();
         }
-    }
-
-    [HarmonyPatch(typeof(Terminal), "ParsePlayerSentence")]
-    public static class TerminalParsePlayerSentencePatch
-    {
-        public static bool Prefix(Terminal __instance, ref TerminalNode __result)
-        {
-            string[] inputLines = __instance.screenText.text.Split('\n');
-            if (inputLines.Length == 0)
-            {
-                return true;
-            }
-
-            string[] commandWords = inputLines.Last().Trim().ToLower().Split(' ');
-            if (commandWords.Length == 0 || commandWords[0] != "customsounds")
-            {
-                return true;
-            }
-
-            Plugin.Instance.logger.LogInfo($"Received terminal command: {string.Join(" ", commandWords)}");
-
-            if (commandWords.Length > 1 && commandWords[0] == "customsounds")
-            {
-                switch (commandWords[1])
-                {
-                    case "reload":
-                        Plugin.Instance.ReloadSounds(false, false);
-                        __result = CreateTerminalNode(Plugin.Instance.GetSoundChanges());
-                        return false;
-
-                    case "revert":
-                        Plugin.Instance.RevertSounds();
-                        __result = CreateTerminalNode("Game sounds reverted to original.");
-                        return false;
-
-                    case "list":
-                        __result = CreateTerminalNode(Plugin.Instance.ListAllSounds());
-                        return false;
-
-                    case "help":
-                        if (NetworkManager.Singleton.IsHost)
-                        {
-                            __result = CreateTerminalNode("CustomSounds commands.\n\n>CUSTOMSOUNDS LIST\nTo displays all currently loaded sounds\n\n>CUSTOMSOUNDS RELOAD\nTo reloads and applies sounds from the 'CustomSounds' folder and its subfolders.\n\n>CUSTOMSOUNDS REVERT\nTo unloads all custom sounds and restores original game sounds\n\n>CUSTOMSOUNDS SYNC\nStarts the sync of custom sounds with clients\n\n>CUSTOMSOUNDS FORCE-UNSYNC\nForces the unsync process for all clients");
-                        }
-                        else
-                        {
-                            __result = CreateTerminalNode("CustomSounds commands.\n\n>CUSTOMSOUNDS LIST\nTo displays all currently loaded sounds\n\n>CUSTOMSOUNDS RELOAD\nTo reloads and applies sounds from the 'CustomSounds' folder and its subfolders.\n\n>CUSTOMSOUNDS REVERT\nTo unloads all custom sounds and restores original game sounds\n\n>CUSTOMSOUNDS UNSYNC\nUnsyncs sounds sent by the host.");
-                        }
-                        return false;
-
-                    case "sync":
-                        if (NetworkManager.Singleton.IsHost)
-                        {
-                            __result = CreateTerminalNode("Custom sound sync initiated. \nSyncing sounds with clients...");
-                            Plugin.Instance.ReloadSounds(true, false);
-                        }
-                        else
-                        {
-                            __result = CreateTerminalNode("/!\\ ERROR /!\\ \nThis command can only be used by the host!");
-                        }
-                        return false;
-
-                    case "unsync":
-                        if (!NetworkManager.Singleton.IsHost)
-                        {
-                            __result = CreateTerminalNode("Unsyncing custom sounds. \nTemporary files deleted and original sounds reloaded.");
-
-                            Plugin.Instance.DeleteTempFolder();
-
-                            Plugin.Instance.ReloadSounds(false, false);
-                        }
-                        else
-                        {
-                            __result = CreateTerminalNode("/!\\ ERROR /!\\ \nThis command cannot be used by the host!");
-                        }
-                        return false;
-
-                    case "force-unsync":
-                        if (NetworkManager.Singleton.IsHost)
-                        {
-                            __result = CreateTerminalNode("Forcing unsync for all clients. \nAll client-side temporary synced files have been deleted, and original sounds reloaded.");
-                            AudioNetworkHandler.Instance.ForceUnsync();
-                        }
-                        else
-                        {
-                            __result = CreateTerminalNode("/!\\ ERROR /!\\ \nThis command can only be used by the host!");
-                        }
-                        return false;
-
-
-                    default:
-                        __result = CreateTerminalNode("Unknown customsounds command.");
-                        return false;
-                }
-            }
-
-            return true;
-        }
-
-        private static TerminalNode CreateTerminalNode(string message)
-        {
-            return new TerminalNode
-            {
-                displayText = message,
-                clearPreviousText = true
-            };
-        }
-    }
-
-
-    [HarmonyPatch]
-    public class NetworkObjectManager
-    {
-
-        [HarmonyPatch(typeof(GameNetworkManager), "Start")]
-        [HarmonyPrefix]
-        public static void Init()
-        {
-            if (networkPrefab != null) return;
-            var bundle = AssetBundle.LoadFromFile(Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "audionetworkhandler"));
-            networkPrefab = bundle.LoadAsset<GameObject>("assets/audionetworkhandler.prefab");
-
-            networkPrefab.AddComponent<AudioNetworkHandler>();
-
-            NetworkManager.Singleton.AddNetworkPrefab(networkPrefab);
-            Plugin.Instance.logger.LogInfo("Created AudioNetworkHandler prefab");
-        }
-
-        [HarmonyPostfix]
-        [HarmonyPatch(typeof(StartOfRound), "Awake")]
-        static void SpawnNetworkHandler()
-        {
-            try
-            {
-                if (NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer)
-                {
-                    Plugin.Instance.logger.LogInfo("Spawning network handler");
-                    networkHandlerHost = Object.Instantiate(networkPrefab, Vector3.zero, Quaternion.identity);
-                    if (networkHandlerHost.GetComponent<NetworkObject>().IsSpawned)
-                    {
-                        Debug.Log("NetworkObject is spawned and active.");
-                    }
-                    else
-                    {
-                        Debug.Log("Failed to spawn NetworkObject.");
-                    }
-
-                    networkHandlerHost.GetComponent<NetworkObject>().Spawn(true);
-
-                    if (AudioNetworkHandler.Instance != null)
-                    {
-                        Debug.Log("Successfully accessed AudioNetworkHandler instance.");
-                    }
-                    else
-                    {
-                        Debug.Log("AudioNetworkHandler instance is null.");
-                    }
-
-                }
-            }
-            catch
-            {
-                Plugin.Instance.logger.LogError("Failed to spawned network handler");
-            }
-        }
-
-        [HarmonyPostfix]
-        [HarmonyPatch(typeof(GameNetworkManager), "StartDisconnect")]
-        static void DestroyNetworkHandler()
-        {
-            try
-            {
-                if (NetworkManager.Singleton.IsHost || NetworkManager.Singleton.IsServer)
-                {
-                    Plugin.Instance.logger.LogInfo("Destroying network handler");
-                    Object.Destroy(networkHandlerHost);
-                    networkHandlerHost = null;
-                }
-            }
-            catch
-            {
-                Plugin.Instance.logger.LogError("Failed to destroy network handler");
-            }
-        }
-
-        static GameObject networkPrefab;
-        static GameObject networkHandlerHost;
     }
 }

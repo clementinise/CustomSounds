@@ -1,15 +1,9 @@
 ﻿using Unity.Netcode;
 using UnityEngine;
-using CustomSounds;
 using System.Collections.Generic;
 using System.Collections;
-using BepInEx.Configuration;
-using UnityEngine.UIElements;
-using BepInEx;
-using System.IO;
-using System;
 
-namespace CustomSoundsComponents
+namespace CustomSounds.Networking
 {
     public class AudioNetworkHandler : NetworkBehaviour
     {
@@ -23,12 +17,12 @@ namespace CustomSoundsComponents
         private int totalSegments;
         private int processedSegments;
 
-        private bool isRequestingSync;
+        public static bool isRequestingSync;
 
         private float[] progressThresholds = new float[] { 0.25f, 0.50f, 0.75f, 1.0f };
         private int lastThresholdIndex = -1;
 
-        private bool hasAcceptedSync = false;
+        public static bool hasAcceptedSync = false;
 
         private void Awake()
         {
@@ -42,19 +36,6 @@ namespace CustomSoundsComponents
             {
                 Destroy(this.gameObject);
                 Debug.Log("Extra AudioNetworkHandler instance destroyed.");
-            }
-        }
-
-        private void Update()
-        {
-            if (isRequestingSync)
-            {
-                if (CustomSounds.Plugin.AcceptSyncKey.Value.IsPressed())
-                {
-                    Plugin.Instance.ShowCustomTip("CustomSounds Sync", "Sync request accepted successfully!", false);
-                    hasAcceptedSync = true;
-                    isRequestingSync = false;
-                }
             }
         }
 
@@ -128,7 +109,7 @@ namespace CustomSoundsComponents
         {
             if (IsServer) return;
 
-            Plugin.Instance.ShowCustomTip("CustomSounds Sync", $"Press {CustomSounds.Plugin.AcceptSyncKey.Value} to accept the audio sync request.", false);
+            Plugin.Instance.ShowCustomTip("CustomSounds Sync", $"Press {Plugin.AcceptSyncKey.Value} to accept the audio sync request.", false);
             isRequestingSync = true;
         }
 
@@ -156,6 +137,7 @@ namespace CustomSoundsComponents
                 Plugin.Instance.ShowCustomTip("CustomSounds Sync", "The CustomSounds sync has been reset by the host.\nTemporary files deleted and original sounds reloaded", false);
 
                 Plugin.Instance.DeleteTempFolder();
+                Plugin.Instance.RevertSounds();
                 Plugin.Instance.ReloadSounds(false, false);
             }
         }
@@ -168,6 +150,10 @@ namespace CustomSoundsComponents
             hasAcceptedSync = false;
 
             ProcessLastAudioFile();
+
+            Debug.Log("Reverting all sounds.");
+            Plugin.Instance.RevertSounds();
+            Debug.Log("All sounds reverted!");
 
             Debug.Log("Reloading all sounds.");
             Plugin.Instance.ReloadSounds(false, true);
@@ -251,6 +237,7 @@ namespace CustomSoundsComponents
             if (hasAcceptedSync)
             {
                 Plugin.Instance.ShowCustomTip("CustomSounds Sync", "Starting audio synchronization. Please wait...", false);
+                Plugin.Instance.DeleteTempFolder();
             }
             else if (IsServer)
             {
